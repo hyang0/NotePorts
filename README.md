@@ -9,7 +9,7 @@
 
 ![](./img/screenshot.png)
 
-```
+
 ### 本地开发
 
 1. 安装依赖：
@@ -29,7 +29,7 @@ python app.py --port 8080
 
 ## 🔧 技术架构
 
-- **后端**: Python Flask + Docker API + psutil
+- **后端**: Python Flask + psutil
 
 
 
@@ -42,7 +42,7 @@ NotePorts 支持以下命令行参数来自定义运行配置：
 | 参数 | 简写 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--port` | `-p` | 7577 | Web服务端口 |
-| `--host` | - | 0.0.0.0 | Web服务监听地址 |
+| `--host` | 无 | 0.0.0.0 | Web服务监听地址 |
 
 **使用示例：**
 ```bash

@@ -70,6 +70,12 @@ def load_config():
         
         processed_config = {}
         for key, value in raw_config.items():
+            # Validate service name (key) to prevent code injection
+            # Allow: alphanumeric, underscore, spaces, hyphen, dot, brackets, slashes, @, #
+            if not re.match(r'^[\w\s\-\.\(\)\[\]/@#]+$', key):
+                logger.warning(f"Skipping invalid service name (potential injection): {key}")
+                continue
+
             # Use key as service name directly
             service_name = key
             
@@ -87,7 +93,11 @@ def load_config():
                 port = value.get('port')
 
             if port is not None:
-                processed_config[service_name] = port
+                # Validate port range
+                if isinstance(port, int) and 1 <= port <= 65535:
+                    processed_config[service_name] = port
+                else:
+                    logger.warning(f"Skipping invalid port for {service_name}: {port}")
         
         return processed_config
     except Exception as e:
@@ -296,6 +306,10 @@ def api_save_config():
             # Validate and process batch update
             new_config = {}
             for key, value in data.items():
+                # Validate service name
+                if not re.match(r'^[\w\s\-\.\(\)\[\]/@#]+$', key):
+                    continue
+
                 if isinstance(value, int):
                     if 1 <= value <= 65535:
                         new_config[key] = value
@@ -318,6 +332,10 @@ def api_save_config():
             if not service_name:
                 return jsonify({'error': 'Service name cannot be empty'}), 400
             
+            # Validate service name
+            if not re.match(r'^[\w\s\-\.\(\)\[\]/@#]+$', service_name):
+                return jsonify({'error': 'Invalid service name. Allowed characters: alphanumeric, space, -, ., (), [], /, @, #'}), 400
+
             if not isinstance(port, int) or port < 1 or port > 65535:
                 return jsonify({'error': 'Invalid port number'}), 400
             
