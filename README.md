@@ -1,5 +1,5 @@
 
-# NotePorts - 容器端口监控工具
+# NotePorts - Windows 端口监控工具
 
 一个windows端口监控和可视化工具，帮助您轻松管理和监控windows服务器上的端口使用情况。
 
