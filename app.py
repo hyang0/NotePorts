@@ -19,6 +19,7 @@ import socket
 import time
 from functools import lru_cache
 import argparse
+import fcntl
 
 # Configure logging
 logging.basicConfig(
@@ -67,21 +68,22 @@ def load_config():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             raw_config = json.load(f)
-        
+
         processed_config = {}
         for key, value in raw_config.items():
             # Validate service name (key) to prevent code injection
-            # Allow: alphanumeric, underscore, spaces, hyphen, dot, brackets, slashes, @, #
-            if not re.match(r'^[\w\s\-\.\(\)\[\]/@#]+$', key):
+            # Only block characters that can create HTML tags (XSS)
+            # Allow: Chinese, English, numbers, and most symbols including quotes & ampersand
+            if re.search(r'[<>]', key):
                 logger.warning(f"Skipping invalid service name (potential injection): {key}")
                 continue
 
             # Use key as service name directly
             service_name = key
-            
+
             # Handle value
             port = None
-            
+
             if isinstance(value, int):
                 port = value
             elif isinstance(value, str):
@@ -98,7 +100,7 @@ def load_config():
                     processed_config[service_name] = port
                 else:
                     logger.warning(f"Skipping invalid port for {service_name}: {port}")
-        
+
         return processed_config
     except Exception as e:
         print(f"Failed to load config: {e}")
@@ -115,13 +117,71 @@ def save_config(config):
                 raw_config[key] = port
             else:
                 raw_config[key] = value
-        
+
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(raw_config, f, indent=2, ensure_ascii=False)
         return True
     except Exception as e:
         print(f"Failed to save config: {e}")
         return False
+
+def atomic_update_config(update_func):
+    """Atomically update config with file lock to prevent race conditions"""
+    import tempfile
+
+    # Use lock file for synchronization
+    lock_file = CONFIG_FILE + '.lock'
+    lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        # Read current config
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                raw_config = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            raw_config = {}
+
+        # Process raw config
+        current_config = {}
+        for key, value in raw_config.items():
+            if re.search(r'[<>]', key):
+                continue
+            port = None
+            if isinstance(value, int):
+                port = value
+            elif isinstance(value, str):
+                try:
+                    port = int(value)
+                except ValueError:
+                    pass
+            elif isinstance(value, dict):
+                port = value.get('port')
+            if port is not None and isinstance(port, int) and 1 <= port <= 65535:
+                current_config[key] = port
+
+        # Apply update function
+        new_config = update_func(current_config)
+
+        # Write to temp file first
+        temp_fd, temp_path = tempfile.mkstemp(dir=CONFIG_DIR, suffix='.json')
+        try:
+            with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                json.dump(new_config, f, indent=2, ensure_ascii=False)
+            # Atomic rename
+            os.replace(temp_path, CONFIG_FILE)
+        except:
+            # Clean up temp file on error
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+            raise
+
+        return new_config
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 # Initialize config
 init_config()
@@ -300,69 +360,68 @@ def api_save_config():
         data = request.get_json()
         if not data:
             return jsonify({'error': 'Invalid data'}), 400
-        
+
         # Check if it's a batch update (dictionary of configs)
         if isinstance(data, dict) and not ('port' in data and 'service_name' in data):
-            # Validate and process batch update
-            new_config = {}
-            for key, value in data.items():
-                # Validate service name
-                if not re.match(r'^[\w\s\-\.\(\)\[\]/@#]+$', key):
-                    continue
+            def update_batch(current_config):
+                for key, value in data.items():
+                    port = None
+                    if isinstance(value, int):
+                        port = value
+                    elif isinstance(value, dict) and 'port' in value:
+                        port = value['port']
+                    elif isinstance(value, str):
+                        try:
+                            port = int(value)
+                        except ValueError:
+                            pass
 
-                if isinstance(value, int):
-                    if 1 <= value <= 65535:
-                        new_config[key] = value
-                elif isinstance(value, dict) and 'port' in value:
-                    port = value['port']
-                    if isinstance(port, int) and 1 <= port <= 65535:
-                        new_config[key] = port
-            
-            if save_config(new_config):
-                config = load_config()
-                return jsonify({'success': True, 'message': 'Config saved'})
-            else:
-                return jsonify({'error': 'Failed to save config'}), 500
+                    if port is not None and isinstance(port, int) and 1 <= port <= 65535:
+                        if not re.search(r'[<>]', key):
+                            current_config[key] = port
+                        else:
+                            logger.warning(f"Skipping service {key} (contains dangerous characters)")
+                    else:
+                        logger.warning(f"Skipping invalid port for {key}: {port}")
+                return current_config
+
+            new_config = atomic_update_config(update_batch)
+            config = new_config
+            return jsonify({'success': True, 'message': 'Config saved'})
 
         # Single port update
         if 'port' in data and 'service_name' in data:
             port = data['port']
             service_name = data['service_name'].strip()
-            
+
             if not service_name:
                 return jsonify({'error': 'Service name cannot be empty'}), 400
-            
-            # Validate service name
-            if not re.match(r'^[\w\s\-\.\(\)\[\]/@#]+$', service_name):
-                return jsonify({'error': 'Invalid service name. Allowed characters: alphanumeric, space, -, ., (), [], /, @, #'}), 400
+
+            # Validate service name - allow Chinese, English, numbers, and most symbols
+            # Only block < > which can be used for HTML tag injection (XSS)
+            if re.search(r'[<>]', service_name):
+                return jsonify({'error': 'Invalid service name. Disallowed characters: < >'}), 400
 
             if not isinstance(port, int) or port < 1 or port > 65535:
                 return jsonify({'error': 'Invalid port number'}), 400
-            
-            current_config = load_config()
-            
-            # Remove existing mapping for this port
-            existing_service = None
-            for service, config_value in current_config.items():
-                # Handle both int and dict config values (migration safety)
-                conf_port = config_value
-                if isinstance(config_value, dict):
-                    conf_port = config_value.get('port')
-                
-                if conf_port == port:
-                    existing_service = service
-                    break
-            
-            if existing_service:
-                del current_config[existing_service]
-            
-            current_config[service_name] = port
-            
-            if save_config(current_config):
-                config = load_config()
-                return jsonify({'success': True, 'message': 'Config saved'})
-            else:
-                return jsonify({'error': 'Failed to save config'}), 500
+
+            def update_single(current_config):
+                # Remove existing mapping for this port
+                existing_service = None
+                for service, config_value in current_config.items():
+                    if config_value == port:
+                        existing_service = service
+                        break
+
+                if existing_service:
+                    del current_config[existing_service]
+
+                current_config[service_name] = port
+                return current_config
+
+            new_config = atomic_update_config(update_single)
+            config = new_config
+            return jsonify({'success': True, 'message': 'Config saved'})
         else:
             # Full config update not fully implemented in this simplified version
             # But we can allow it if needed, or just support single port update for now.
