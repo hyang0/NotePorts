@@ -10,6 +10,8 @@ Main features:
 import psutil
 import json
 import re
+import sqlite3
+import shutil
 from flask import Flask, render_template, jsonify, request
 from collections import defaultdict
 import logging
@@ -33,6 +35,7 @@ app = Flask(__name__)
 # Config file paths
 CONFIG_DIR = os.path.join(os.getcwd(), 'config')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
+DB_FILE = os.path.join(CONFIG_DIR, 'noteports.db')
 
 def init_config():
     """Initialize configuration file"""
@@ -64,65 +67,59 @@ def init_config():
         print(f"Config file exists: {CONFIG_FILE}")
 
 def load_config():
-    """Load config file"""
+    """Load config from SQLite, returns {service_name: port} format for API compatibility"""
+    config = {}
     try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            raw_config = json.load(f)
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT port, service_name FROM services')
+        rows = cursor.fetchall()
+        conn.close()
 
-        processed_config = {}
-        for key, value in raw_config.items():
-            # Validate service name (key) to prevent code injection
-            # Only block characters that can create HTML tags (XSS)
-            # Allow: Chinese, English, numbers, and most symbols including quotes & ampersand
-            if re.search(r'[<>]', key):
-                logger.warning(f"Skipping invalid service name (potential injection): {key}")
-                continue
+        for port, service_name in rows:
+            config[service_name] = port
 
-            # Use key as service name directly
-            service_name = key
-
-            # Handle value
-            port = None
-
-            if isinstance(value, int):
-                port = value
-            elif isinstance(value, str):
-                try:
-                    port = int(value)
-                except ValueError:
-                    pass
-            elif isinstance(value, dict):
-                port = value.get('port')
-
-            if port is not None:
-                # Validate port range
-                if isinstance(port, int) and 1 <= port <= 65535:
-                    processed_config[service_name] = port
-                else:
-                    logger.warning(f"Skipping invalid port for {service_name}: {port}")
-
-        return processed_config
+        return config
     except Exception as e:
-        print(f"Failed to load config: {e}")
+        logger.error(f"Failed to load config from SQLite: {e}")
         return {}
 
 def save_config(config):
-    """Save config file"""
+    """Save config to SQLite (full config replace)"""
     try:
-        raw_config = {}
-        for key, value in config.items():
-            if isinstance(value, dict) and 'port' in value:
-                port = value['port']
-                # Save as simple integer key-value pair
-                raw_config[key] = port
-            else:
-                raw_config[key] = value
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
 
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(raw_config, f, indent=2, ensure_ascii=False)
+        # Use transaction for atomicity
+        cursor.execute('BEGIN TRANSACTION')
+        cursor.execute('DELETE FROM services')
+
+        for service_name, port in config.items():
+            # Validate service name
+            if re.search(r'[<>]', service_name):
+                logger.warning(f"Skipping invalid service name (potential injection): {service_name}")
+                continue
+
+            # Handle port conversion
+            if isinstance(port, str):
+                try:
+                    port = int(port)
+                except ValueError:
+                    logger.warning(f"Skipping invalid port for {service_name}: {port}")
+                    continue
+            if not (isinstance(port, int) and 1 <= port <= 65535):
+                logger.warning(f"Skipping invalid port for {service_name}: {port}")
+                continue
+
+            cursor.execute('''
+                INSERT INTO services (port, service_name) VALUES (?, ?)
+            ''', (port, service_name))
+
+        conn.commit()
+        conn.close()
         return True
     except Exception as e:
-        print(f"Failed to save config: {e}")
+        logger.error(f"Failed to save config: {e}")
         return False
 
 def atomic_update_config(update_func):
@@ -183,36 +180,138 @@ def atomic_update_config(update_func):
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
 
+
+def init_db():
+    """Initialize SQLite database and create table"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Create table with port as primary key
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS services (
+            port INTEGER PRIMARY KEY,
+            service_name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+
+
+def migrate_json_to_db():
+    """Migrate existing JSON data to SQLite if database is empty"""
+    # Check if database already has data
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM services')
+    count = cursor.fetchone()[0]
+    conn.close()
+
+    if count > 0:
+        # Already has data, no migration needed
+        return True
+
+    # Load data from JSON
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            json_config = json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to read JSON for migration: {e}")
+        return False
+
+    # Migrate to SQLite
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    migrated = 0
+    for service_name, port in json_config.items():
+        # Handle port conversion
+        if isinstance(port, str):
+            try:
+                port = int(port)
+            except ValueError:
+                continue
+        if not (isinstance(port, int) and 1 <= port <= 65535):
+            continue
+        # Validate service name
+        if re.search(r'[<>]', service_name):
+            continue
+
+        # Insert, port primary key handles conflicts automatically
+        cursor.execute('''
+            INSERT OR REPLACE INTO services (port, service_name)
+            VALUES (?, ?)
+        ''', (port, service_name))
+        migrated += 1
+
+    conn.commit()
+    conn.close()
+
+    # Backup original JSON file
+    if os.path.exists(CONFIG_FILE):
+        backup_file = CONFIG_FILE + '.bak'
+        shutil.copy2(CONFIG_FILE, backup_file)
+        logger.info(f"Original JSON config backed up to: {backup_file}")
+
+    logger.info(f"Migration completed: {migrated} entries migrated")
+    return True
+
+
 # Initialize config
 init_config()
+init_db()
+migrate_json_to_db()
 config = load_config()
 
 class PortMonitor:
     """Port Monitor Class"""
-    
+
     def __init__(self):
         # Default port service mapping
         self.default_ports = {
-            21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP", 
-            110: "POP3", 135: "RPC", 139: "NetBIOS Session", 143: "IMAP", 443: "HTTPS", 
-            445: "SMB", 1433: "SQL Server", 1521: "Oracle", 3306: "MySQL", 3389: "RDP", 
-            5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 8080: "HTTP Proxy", 
+            21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP",
+            110: "POP3", 135: "RPC", 139: "NetBIOS Session", 143: "IMAP", 443: "HTTPS",
+            445: "SMB", 1433: "SQL Server", 1521: "Oracle", 3306: "MySQL", 3389: "RDP",
+            5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 8080: "HTTP Proxy",
             8443: "HTTPS Alt", 9200: "Elasticsearch", 27017: "MongoDB"
         }
-    
+        # Load port cache from SQLite (port -> service_name)
+        self.port_cache = self._load_port_cache()
+
+    def _load_port_cache(self):
+        """Load all port-service mappings from SQLite into memory cache"""
+        cache = {}
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('SELECT port, service_name FROM services')
+            rows = cursor.fetchall()
+            for port, service_name in rows:
+                cache[port] = service_name
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to load port cache: {e}")
+        return cache
+
+    def refresh_cache(self):
+        """Refresh cache after config update"""
+        self.port_cache = self._load_port_cache()
+
     def get_host_ports(self):
         """Get host TCP ports using psutil"""
         port_info = {}
-        
+
         try:
             # Get all network connections
             connections = psutil.net_connections(kind='tcp')
-            
+
             for conn in connections:
                 # We only care about LISTENING ports
                 if conn.status == psutil.CONN_LISTEN:
                     port = conn.laddr.port
-                    
+
                     # Get process info if available
                     pid = conn.pid
                     process_name = "Unknown"
@@ -231,30 +330,21 @@ class PortMonitor:
                             'process': process_name,
                             'pid': pid
                         }
-                    
+
         except Exception as e:
             logger.error(f"Failed to get host ports: {e}")
-        
+
         return port_info
-    
+
     def get_service_name(self, port):
         """Get service name based on port"""
-        # Get from config first
-        config_ports = {}
-        for k, v in config.items():
-            if isinstance(v, int):
-                config_ports[k] = v
-            elif isinstance(v, dict) and 'port' in v:
-                config_ports[k] = v['port']
-        
-        port_to_service = {v: k for k, v in config_ports.items()}
-        
-        if port in port_to_service:
-            return port_to_service[port]
-        
+        # Get from cache first (loaded from SQLite)
+        if port in self.port_cache:
+            return self.port_cache[port]
+
         if port in self.default_ports:
             return self.default_ports[port]
-        
+
         return 'Unknown Service'
     
     def get_port_analysis(self, start_port=1, end_port=65535):
@@ -361,35 +451,50 @@ def api_save_config():
         if not data:
             return jsonify({'error': 'Invalid data'}), 400
 
-        # Check if it's a batch update (dictionary of configs)
+        # Check if it's a batch update (dictionary of configs in {service_name: port} format)
         if isinstance(data, dict) and not ('port' in data and 'service_name' in data):
-            def update_batch(current_config):
-                for key, value in data.items():
-                    port = None
-                    if isinstance(value, int):
-                        port = value
-                    elif isinstance(value, dict) and 'port' in value:
-                        port = value['port']
-                    elif isinstance(value, str):
-                        try:
-                            port = int(value)
-                        except ValueError:
-                            pass
+            # Batch update - replace all config
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
 
-                    if port is not None and isinstance(port, int) and 1 <= port <= 65535:
-                        if not re.search(r'[<>]', key):
-                            current_config[key] = port
-                        else:
-                            logger.warning(f"Skipping service {key} (contains dangerous characters)")
-                    else:
-                        logger.warning(f"Skipping invalid port for {key}: {port}")
-                return current_config
+            # Use transaction for atomicity
+            cursor.execute('BEGIN TRANSACTION')
+            cursor.execute('DELETE FROM services')
 
-            new_config = atomic_update_config(update_batch)
-            config = new_config
+            for service_name, value in data.items():
+                # Validate service name
+                if re.search(r'[<>]', service_name):
+                    logger.warning(f"Skipping invalid service name (potential injection): {service_name}")
+                    continue
+
+                # Handle port conversion
+                port = None
+                if isinstance(value, int):
+                    port = value
+                elif isinstance(value, str):
+                    try:
+                        port = int(value)
+                    except ValueError:
+                        pass
+                elif isinstance(value, dict) and 'port' in value:
+                    port = value.get('port')
+
+                if port is not None and isinstance(port, int) and 1 <= port <= 65535:
+                    cursor.execute('''
+                        INSERT INTO services (port, service_name) VALUES (?, ?)
+                    ''', (port, service_name))
+                else:
+                    logger.warning(f"Skipping invalid port for {service_name}: {port}")
+
+            conn.commit()
+            conn.close()
+
+            # Refresh global config and cache
+            config = load_config()
+            port_monitor.refresh_cache()
             return jsonify({'success': True, 'message': 'Config saved'})
 
-        # Single port update
+        # Single port update - much simpler with port as primary key
         if 'port' in data and 'service_name' in data:
             port = data['port']
             service_name = data['service_name'].strip()
@@ -405,29 +510,23 @@ def api_save_config():
             if not isinstance(port, int) or port < 1 or port > 65535:
                 return jsonify({'error': 'Invalid port number'}), 400
 
-            def update_single(current_config):
-                # Remove existing mapping for this port
-                existing_service = None
-                for service, config_value in current_config.items():
-                    if config_value == port:
-                        existing_service = service
-                        break
+            # Use SQLite transaction - atomic upsert
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO services (port, service_name, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            ''', (port, service_name))
+            conn.commit()
+            conn.close()
 
-                if existing_service:
-                    del current_config[existing_service]
-
-                current_config[service_name] = port
-                return current_config
-
-            new_config = atomic_update_config(update_single)
-            config = new_config
+            # Refresh global config and cache
+            config = load_config()
+            port_monitor.refresh_cache()
             return jsonify({'success': True, 'message': 'Config saved'})
         else:
-            # Full config update not fully implemented in this simplified version
-            # But we can allow it if needed, or just support single port update for now.
-            # Let's keep it simple for now as the frontend might use it.
-            return jsonify({'error': 'Batch update not supported in this version'}), 400
-            
+            return jsonify({'error': 'Invalid request format'}), 400
+
     except Exception as e:
         logger.error(f"Error saving config: {e}")
         return jsonify({'error': str(e)}), 500
